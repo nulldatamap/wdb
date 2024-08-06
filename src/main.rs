@@ -1,11 +1,18 @@
+use std::error::Error;
+
 use clap::{Args, Parser, Subcommand};
-use rusqlite::{Connection, Row};
+use rusqlite::{params, Connection, Row};
 
 type DbResult<E> = rusqlite::Result<E>;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Disable automatically checking word statuses (like missing IPA)
+    #[arg(short, long)]
+    disable_checks: bool,
+    #[arg(long)]
+    debug_mode: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -18,6 +25,8 @@ enum Command {
     Dump(DumpArgs),
     /// List all languages
     List,
+    /// Generate phonetic annotations for words based on thier romanization
+    Phon(PhonArgs),
 }
 
 #[derive(Args)]
@@ -47,29 +56,40 @@ struct AddArgs {
     homophone: bool,
 }
 
+#[derive(Args, Debug)]
+struct PhonArgs {
+    #[arg(short, long = "lang")]
+    language_id: Option<String>,
+    /// Regenerate ALL phonetic annotation, not just the missing ones
+    #[arg(short, long)]
+    force: bool,
+}
+
 #[derive(Debug)]
 struct WordEntry {
     id: u32,
-    ipa: String,
+    lang: String,
     romanization: String,
+    ipa: Option<String>,
     meaning: String,
     kind: String,
-    origin: String,
-    flags: String,
-    note: String,
+    origin: Option<String>,
+    flags: Option<String>,
+    note: Option<String>,
 }
 
 impl WordEntry {
     fn from_row(row: &Row) -> DbResult<WordEntry> {
         Ok(WordEntry {
             id: row.get(0)?,
-            ipa: row.get(1)?,
+            lang: row.get(1)?,
             romanization: row.get(2)?,
-            meaning: row.get(3)?,
-            kind: row.get(4)?,
-            origin: row.get(5)?,
-            flags: row.get(6)?,
-            note: row.get(7)?,
+            ipa: row.get(3)?,
+            meaning: row.get(4)?,
+            kind: row.get(5)?,
+            origin: row.get(6)?,
+            flags: row.get(7)?,
+            note: row.get(8)?,
         })
     }
 }
@@ -77,8 +97,9 @@ impl WordEntry {
 #[derive(Debug)]
 struct LangEntry {
     id: String,
-    table: String,
     name: String,
+    origin: Option<String>,
+    rule: String,
 }
 
 impl std::fmt::Display for LangEntry {
@@ -91,8 +112,9 @@ impl LangEntry {
     fn from_row(row: &Row) -> DbResult<LangEntry> {
         Ok(LangEntry {
             id: row.get(0)?,
-            table: row.get(1)?,
-            name: row.get(2)?,
+            name: row.get(1)?,
+            origin: row.get(2)?,
+            rule: row.get(3)?,
         })
     }
 }
@@ -105,6 +127,98 @@ struct Wdb {
     db: Connection,
 }
 
+enum LexurgyMode {
+    Evolve,
+    Deromanize,
+    Romanize,
+}
+
+struct LexurgyCmd {
+    input: String,
+    rule: String,
+    output: Option<String>,
+    mode: LexurgyMode,
+}
+
+const WORD_LIST_PATH: &'static str = "../WordLists";
+const LSC_PATH: &'static str = "../SoundChanges";
+
+impl LexurgyCmd {
+    fn run<'a>(self, words: impl Iterator<Item = &'a str>) -> Result<Vec<String>, Box<dyn Error>> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+        use std::path::Path;
+        use std::process::*;
+
+        let wli = Path::new(WORD_LIST_PATH)
+            .join(&self.input)
+            .with_extension("wli");
+
+        {
+            let mut f = File::create(&wli)?;
+            let mut buf = BufWriter::new(f);
+
+            for word in words {
+                buf.write_all(word.as_bytes())?;
+                buf.write_all(b"\n")?;
+            }
+        }
+
+        let lsc = Path::new(LSC_PATH).join(self.rule).with_extension("lsc");
+
+        let out = Path::new(WORD_LIST_PATH).join("out");
+
+        let mut lexurgy = Command::new(if cfg!(windows) {
+            "lexurgy.bat"
+        } else {
+            "lexurgy"
+        });
+        lexurgy
+            .arg("sc")
+            .arg(&lsc)
+            .arg(&wli)
+            .arg("--out-dir")
+            .arg(&out);
+
+        match self.mode {
+            LexurgyMode::Evolve => {
+                panic!("TODO!")
+            }
+            LexurgyMode::Romanize => {
+                panic!("TODO!")
+            }
+            LexurgyMode::Deromanize => {
+                lexurgy.arg("-p").arg("-b").arg("init");
+            }
+        }
+
+        let cmd = format!("{:?}", &lexurgy);
+        let output = lexurgy.output().unwrap();
+        if !output.status.success() {
+            return Err(format!(
+                "{:?} failed.\nSTDOUT:\n{}\nSTDERR:\n{}\n",
+                cmd,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+
+        let ev_wli = Path::new(WORD_LIST_PATH)
+            .join("out")
+            .join(format!("{}_ev", &self.input))
+            .with_extension("wli");
+        let f = File::open(ev_wli)?;
+        let mut reader = BufReader::new(f);
+        Ok(reader.lines().map(|l| l.unwrap()).collect())
+    }
+}
+
+#[cfg(debug_assertions)]
+const DB_FILE: &'static str = "../langs-dev.db";
+#[cfg(not(debug_assertions))]
+const DB_FILE: &'static str = "../langs.db";
+
 impl Wdb {
     fn new() -> DbResult<Wdb> {
         Ok(Wdb {
@@ -112,7 +226,7 @@ impl Wdb {
         })
     }
 
-    fn resolve_lang(&self, lang: &str) -> rusqlite::Result<LangEntry> {
+    fn get_lang(&self, lang: &str) -> rusqlite::Result<LangEntry> {
         self.db.query_row(
             "SELECT * FROM langs WHERE id = ?",
             [lang],
@@ -120,33 +234,34 @@ impl Wdb {
         )
     }
 
+    fn get_langs(&self) -> DbResult<Vec<LangEntry>> {
+        let mut stmt = self.db.prepare("SELECT * FROM langs").unwrap();
+        let mut entries = stmt.query_map([], LangEntry::from_row).unwrap();
+        Ok(entries.map(|x| x.unwrap()).collect())
+    }
+
     fn dump(&mut self, args: DumpArgs) {
-        let lang = self
-            .resolve_lang(&args.language_id)
-            .expect("Invalid language");
+        let lang = self.get_lang(&args.language_id).expect("Invalid language");
         let mut stmt = self
             .db
-            .prepare(&format!("SELECT * FROM {}", lang.table))
+            .prepare("SELECT * FROM words WHERE lang = ? ORDER BY romanization")
             .unwrap();
-        let mut entries = stmt.query_map([], WordEntry::from_row).unwrap();
+        let mut entries = stmt.query_map([&lang.id], WordEntry::from_row).unwrap();
 
+        println!("{} words:", &lang);
         for entry in entries {
-            println!("{:?}", entry);
+            println!("  {:?}", entry);
         }
     }
 
     fn list(&mut self) {
-        let mut stmt = self.db.prepare("SELECT * FROM langs").unwrap();
-        let mut entries = stmt.query_map([], LangEntry::from_row).unwrap();
-
         println!("Languages:");
-        for entry in entries {
-            let entry = entry.unwrap();
+        for entry in self.get_langs().unwrap() {
             let words: u32 = self
                 .db
                 .query_row(
-                    &format!("SELECT COUNT(id) FROM {}", entry.table),
-                    [],
+                    "SELECT COUNT(id) FROM words WHERE lang = ?",
+                    [&entry.id],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -156,32 +271,157 @@ impl Wdb {
 
     fn add(&mut self, args: AddArgs) {
         println!("{:?}", args);
-        let lang = self.resolve_lang(&args.language_id).unwrap();
+        let lang = self.get_lang(&args.language_id).unwrap();
         let rom = normalize_text(&args.word);
         // Make sure there isn't already another word in the db if it's not supposed to be a homophone
         if !args.homophone {
             let mut stmt = self
                 .db
-                .prepare(&format!("SELECT * FROM {} WHERE romanization = ?", &lang.table))
+                .prepare("SELECT * FROM words WHERE romanization = ? AND lang = ?")
                 .unwrap();
-            let mut homophones: Vec<_> = stmt.query_map([&rom], WordEntry::from_row).unwrap().map(|x| x.unwrap()).collect();
+            let mut homophones: Vec<_> = stmt
+                .query_map([&rom, &lang.id], WordEntry::from_row)
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect();
             if !homophones.is_empty() {
-                println!("Error adding word `{}` to language {}. \nThe following homophone(s) exist already:", &rom, lang);
+                println!("Error adding word `{}` to language {}. \n\nThe following homophone(s) exist already:", &rom, lang);
                 for h in homophones {
                     println!(" - {}: {}, {}", h.romanization, h.meaning, h.kind);
                 }
 
-                println!("If you want to add another homophone, use the -H flag.");
+                println!("\nIf you want to add it as a homophone, use the -H flag.");
                 std::process::exit(1);
             }
         }
 
+        let _ = self
+            .db
+            .execute(
+                "INSERT INTO words
+               (lang, romanization, meaning, kind, note, origin, flags)
+               VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    &lang.id,
+                    &rom,
+                    &args.meaning,
+                    &normalize_text(&args.kind),
+                    &args.note.unwrap_or(String::new()),
+                    &args.origin.unwrap_or(String::new()),
+                    "",
+                ],
+            )
+            .unwrap();
+        println!("Added `{}` to {}", &args.word, lang);
+    }
 
+    fn check_missing_ipa(&mut self) {
+        let mut stmt = self
+            .db
+            .prepare("SELECT * FROM words WHERE ipa IS NULL ORDER BY lang DESC, romanization")
+            .unwrap();
+        let mut words = stmt
+            .query_map([], WordEntry::from_row)
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect::<Vec<_>>();
+
+        if words.is_empty() {
+            return;
+        }
+
+        println!("\nNOTE: The following words are missing phonetic annotation:");
+        for lang_words in words.chunk_by(|w0, w1| w0.lang == w1.lang) {
+            println!("{}", self.get_lang(&lang_words[0].lang).unwrap());
+            for word in lang_words {
+                println!("- {}: {} ({})", word.romanization, word.meaning, word.kind);
+            }
+        }
+        println!("\nRun `wdb phon` to generate phonetic annotations based on their romanization.");
+    }
+
+    fn deromanize(&mut self, args: PhonArgs) {
+        let languages = args
+            .language_id
+            .as_ref()
+            .map(|l| vec![self.get_lang(l).unwrap()])
+            .unwrap_or_else(|| self.get_langs().unwrap());
+        let mut any_change = false;
+        for lang in languages {
+            let words = {
+                let mut stmt = self
+                    .db
+                    .prepare(&format!(
+                        "SELECT * FROM words WHERE lang = ? {}",
+                        if args.force { "" } else { "AND ipa IS NULL" }
+                    ))
+                    .unwrap();
+                stmt.query_map([&lang.id], WordEntry::from_row)
+                    .unwrap()
+                    .map(|x| x.unwrap())
+                    .collect::<Vec<_>>()
+            };
+
+            if words.is_empty() {
+                continue;
+            }
+
+            any_change = true;
+
+            let lexurgy = LexurgyCmd {
+                mode: LexurgyMode::Deromanize,
+                input: format!("{}_rom", &lang.id),
+                output: None,
+                rule: lang.rule.clone(),
+            };
+            println!("Running `{}` deromanization rule...", &lang.rule);
+            let phons = lexurgy
+                .run(words.iter().map(|w| &w.romanization[..]))
+                .unwrap();
+            if phons.len() != words.len() {
+                println!(
+                    "ERROR: Number of words out ({}) doesn't match number of words in({})!'",
+                    phons.len(),
+                    words.len()
+                );
+            }
+            for (word, phon) in words.iter().zip(phons.iter()) {
+                println!(" {} => {}", &word.romanization, phon);
+            }
+
+            let mut write_phons = ||
+            {
+                let tr = self.db.transaction()?;
+                for (word, phon) in words.iter().zip(phons.iter()) {
+                    tr.execute(
+                        "UPDATE words SET ipa = ? WHERE id = ?",
+                        params![phon, word.id],
+                    )?;
+                }
+                tr.commit() };
+
+            if let Err(err) = write_phons() {
+                println!("Error: failed to update phonetic annotation. No words changed.\n{}", err);
+                std::process::exit(1);
+            } else {
+                println!("Updated {} word entries", words.len());
+            }
+        }
+
+        if !any_change {
+            println!("No word updated, every word present has a phonetic annotation.\nIf you want to update all anyway, use the -f flag.");
+        }
     }
 }
 
 fn main() {
-    let cli = Cli::parse();
+    if cfg!(debug_assertion) {
+        println!(
+            "NOTE: Running in debug, changes are done to the `lang-dev.db` instead of `lang.db`\n"
+        );
+    }
+    let mut cli = Cli::parse();
+    cli.debug_mode |= cfg!(debug_assertion);
 
     let mut wdb = Wdb::new().unwrap();
 
@@ -189,6 +429,14 @@ fn main() {
         Some(Command::Dump(args)) => wdb.dump(args),
         Some(Command::List) => wdb.list(),
         Some(Command::Add(args)) => wdb.add(args),
+        Some(Command::Phon(args)) => {
+            cli.disable_checks = args.language_id.is_none();
+            wdb.deromanize(args)
+        }
         None => {}
+    }
+
+    if !cli.disable_checks {
+        wdb.check_missing_ipa();
     }
 }
