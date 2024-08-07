@@ -219,7 +219,7 @@ impl LexurgyCmd {
         wli.set_extension("wli");
 
         {
-            let mut f = File::create(&wli)?;
+            let f = File::create(&wli)?;
             let mut buf = BufWriter::new(f);
 
             for word in words {
@@ -279,15 +279,10 @@ impl LexurgyCmd {
         ev_wli.push(format!("{}_ev", &self.input));
         ev_wli.set_extension("wli");
         let f = File::open(ev_wli)?;
-        let mut reader = BufReader::new(f);
+        let reader = BufReader::new(f);
         Ok(reader.lines().map(|l| l.unwrap()).collect())
     }
 }
-
-#[cfg(debug_assertions)]
-const DB_FILE: &'static str = "../langs-dev.db";
-#[cfg(not(debug_assertions))]
-const DB_FILE: &'static str = "../langs.db";
 
 impl Wdb {
     fn new(cfg: Config) -> DbResult<Wdb> {
@@ -313,7 +308,7 @@ impl Wdb {
 
     fn get_langs(&self) -> DbResult<Vec<LangEntry>> {
         let mut stmt = self.db.prepare("SELECT * FROM langs").unwrap();
-        let mut entries = stmt.query_map([], LangEntry::from_row).unwrap();
+        let entries = stmt.query_map([], LangEntry::from_row).unwrap();
         Ok(entries.map(|x| x.unwrap()).collect())
     }
 
@@ -323,7 +318,7 @@ impl Wdb {
             .db
             .prepare("SELECT * FROM words WHERE lang = ? ORDER BY romanization")
             .unwrap();
-        let mut entries = stmt.query_map([&lang.id], WordEntry::from_row).unwrap();
+        let entries = stmt.query_map([&lang.id], WordEntry::from_row).unwrap();
 
         println!("{} words:", &lang);
         for entry in entries {
@@ -356,7 +351,7 @@ impl Wdb {
                 .db
                 .prepare("SELECT * FROM words WHERE romanization = ? AND lang = ?")
                 .unwrap();
-            let mut homophones: Vec<_> = stmt
+            let homophones: Vec<_> = stmt
                 .query_map([&rom, &lang.id], WordEntry::from_row)
                 .unwrap()
                 .map(|x| x.unwrap())
@@ -411,7 +406,7 @@ impl Wdb {
             .db
             .prepare("SELECT * FROM words WHERE ipa IS NULL ORDER BY lang DESC, romanization")
             .unwrap();
-        let mut words = stmt
+        let words = stmt
             .query_map([], WordEntry::from_row)
             .unwrap()
             .map(|x| x.unwrap())
@@ -520,15 +515,17 @@ fn load_settings(root: &path::Path) -> Settings {
 }
 
 fn main() {
-    if cfg!(debug_assertions) {
-        println!(
-            "NOTE: Running in debug, changes are done to the `lang-dev.db` instead of `lang.db`\n"
-        );
-    }
     let mut cli = Cli::parse();
     let root = find_obsidian_root();
     let settings = load_settings(&root);
-    let mut cfg = Config::new(root, settings, cli.debug_mode | cfg!(debug_assertions));
+    if cfg!(debug_assertions) {
+        println!(
+            "NOTE: Running in debug, changes are done to the `{}` instead of `{}`\n",
+            &settings.db_dev_file,
+            &settings.db_file,
+        );
+    }
+    let cfg = Config::new(root, settings, cli.debug_mode | cfg!(debug_assertions));
 
     let mut wdb = Wdb::new(cfg).unwrap();
 
