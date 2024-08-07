@@ -8,3 +8,5 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5.13", features = ["derive"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.204", features = ["derive"] }
+toml = "0.8.19"

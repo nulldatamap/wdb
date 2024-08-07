@@ -1,9 +1,60 @@
 use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::*;
 
+use serde::Deserialize;
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{params, Connection, Row};
 
 type DbResult<E> = rusqlite::Result<E>;
+
+#[derive(Deserialize)]
+struct Settings {
+    db_file: String,
+    db_dev_file: String,
+    word_list_folder: String,
+    rule_list_folder: String,
+}
+
+struct Config {
+    root: PathBuf,
+    debug_mode: bool,
+    settings: Settings,
+    word_list_folder: cell::OnceCell<PathBuf>,
+    rule_list_folder: cell::OnceCell<PathBuf>,
+}
+
+impl Config {
+    fn new(root: PathBuf, settings: Settings, debug_mode: bool) -> Config {
+        Config {
+            root,
+            settings,
+            debug_mode,
+            word_list_folder: cell::OnceCell::new(),
+            rule_list_folder: cell::OnceCell::new(),
+        }
+    }
+
+    fn word_list_folder(&self) -> &Path {
+        let p = self.word_list_folder.get_or_init(|| {
+            let mut b = PathBuf::new();
+            b.push(&self.root);
+            b.push(&self.settings.word_list_folder);
+            b
+        });
+        p.as_path()
+    }
+
+    fn rule_list_folder(&self) -> &Path {
+        let p = self.rule_list_folder.get_or_init(|| {
+            let mut b = PathBuf::new();
+            b.push(&self.root);
+            b.push(&self.settings.rule_list_folder);
+            b
+        });
+        p.as_path()
+    }
+}
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -32,13 +83,13 @@ enum Command {
 #[derive(Args)]
 struct DumpArgs {
     /// ID of the target language
-    language_id: String,
+    language: String,
 }
 
 #[derive(Args, Debug)]
 struct AddArgs {
     /// The language to add the word to
-    language_id: String,
+    language: String,
     /// The romanized spelling of the word
     word: String,
     /// The meaning of the word
@@ -51,6 +102,12 @@ struct AddArgs {
     /// Attach a note to the word (arbitrary text)
     #[arg(short, long)]
     note: Option<String>,
+    /// The phonetic transcription of the word
+    #[arg(short, long)]
+    ipa: Option<String>,
+    /// Disable auto-deromanization
+    #[arg(short = 'D', long)]
+    disable_autorom: bool,
     /// Allow definining the word to be a homophone of any existing words
     #[arg(short = 'H', long)]
     homophone: bool,
@@ -59,7 +116,7 @@ struct AddArgs {
 #[derive(Args, Debug)]
 struct PhonArgs {
     #[arg(short, long = "lang")]
-    language_id: Option<String>,
+    language: Option<String>,
     /// Regenerate ALL phonetic annotation, not just the missing ones
     #[arg(short, long)]
     force: bool,
@@ -125,6 +182,7 @@ fn normalize_text(s: &str) -> String {
 
 struct Wdb {
     db: Connection,
+    cfg: Config,
 }
 
 enum LexurgyMode {
@@ -140,19 +198,25 @@ struct LexurgyCmd {
     mode: LexurgyMode,
 }
 
-const WORD_LIST_PATH: &'static str = "../WordLists";
-const LSC_PATH: &'static str = "../SoundChanges";
-
 impl LexurgyCmd {
-    fn run<'a>(self, words: impl Iterator<Item = &'a str>) -> Result<Vec<String>, Box<dyn Error>> {
+    fn deromanize(lang: &LangEntry) -> LexurgyCmd {
+        LexurgyCmd {
+            mode: LexurgyMode::Deromanize,
+            input: format!("{}_rom", &lang.id),
+            output: None,
+            rule: lang.rule.clone(),
+        }
+    }
+
+    fn run<'a>(self, cfg: &Config, words: impl Iterator<Item = &'a str>) -> Result<Vec<String>, Box<dyn Error>> {
         use std::fs::File;
-        use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-        use std::path::Path;
+        use std::io::{BufRead, BufReader, BufWriter, Write};
         use std::process::*;
 
-        let wli = Path::new(WORD_LIST_PATH)
-            .join(&self.input)
-            .with_extension("wli");
+        let mut wli = PathBuf::new();
+        wli.push(cfg.word_list_folder());
+        wli.push(&self.input);
+        wli.set_extension("wli");
 
         {
             let mut f = File::create(&wli)?;
@@ -164,9 +228,14 @@ impl LexurgyCmd {
             }
         }
 
-        let lsc = Path::new(LSC_PATH).join(self.rule).with_extension("lsc");
+        let mut lsc = PathBuf::new();
+        lsc.push(cfg.rule_list_folder());
+        lsc.push(self.rule);
+        lsc.set_extension("lsc");
 
-        let out = Path::new(WORD_LIST_PATH).join("out");
+        let mut out = PathBuf::new();
+        out.push(cfg.word_list_folder());
+        out.push("out");
 
         let mut lexurgy = Command::new(if cfg!(windows) {
             "lexurgy.bat"
@@ -201,13 +270,14 @@ impl LexurgyCmd {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             )
-            .into());
+                       .into());
         }
 
-        let ev_wli = Path::new(WORD_LIST_PATH)
-            .join("out")
-            .join(format!("{}_ev", &self.input))
-            .with_extension("wli");
+        let mut ev_wli = PathBuf::new();
+        ev_wli.push(cfg.word_list_folder());
+        ev_wli.push("out");
+        ev_wli.push(format!("{}_ev", &self.input));
+        ev_wli.set_extension("wli");
         let f = File::open(ev_wli)?;
         let mut reader = BufReader::new(f);
         Ok(reader.lines().map(|l| l.unwrap()).collect())
@@ -220,9 +290,16 @@ const DB_FILE: &'static str = "../langs-dev.db";
 const DB_FILE: &'static str = "../langs.db";
 
 impl Wdb {
-    fn new() -> DbResult<Wdb> {
+    fn new(cfg: Config) -> DbResult<Wdb> {
+        let db_file =
+            if cfg.debug_mode {
+                cfg.root.join(&cfg.settings.db_dev_file)
+            } else {
+                cfg.root.join(&cfg.settings.db_file)
+            };
         Ok(Wdb {
-            db: Connection::open("../langs.db")?,
+            db: Connection::open(db_file)?,
+            cfg,
         })
     }
 
@@ -241,7 +318,7 @@ impl Wdb {
     }
 
     fn dump(&mut self, args: DumpArgs) {
-        let lang = self.get_lang(&args.language_id).expect("Invalid language");
+        let lang = self.get_lang(&args.language).expect("Invalid language");
         let mut stmt = self
             .db
             .prepare("SELECT * FROM words WHERE lang = ? ORDER BY romanization")
@@ -271,7 +348,7 @@ impl Wdb {
 
     fn add(&mut self, args: AddArgs) {
         println!("{:?}", args);
-        let lang = self.get_lang(&args.language_id).unwrap();
+        let lang = self.get_lang(&args.language).unwrap();
         let rom = normalize_text(&args.word);
         // Make sure there isn't already another word in the db if it's not supposed to be a homophone
         if !args.homophone {
@@ -295,15 +372,29 @@ impl Wdb {
             }
         }
 
+        let mut phon: Option<String> = args.ipa;
+
+        if phon.is_none() && !args.disable_autorom {
+            println!("Reromanization...");
+            let mut phons = LexurgyCmd::deromanize(&lang).run(&self.cfg, std::iter::once(&rom[..])).unwrap();
+            if phons.len() != 1 {
+                println!("Error: expected a single word back, got {}", phons.len());
+                std::process::exit(1);
+            }
+            println!("  {} => {}", &rom, &phons[0]);
+            phon = Some(phons.remove(0));
+        }
+
         let _ = self
             .db
             .execute(
                 "INSERT INTO words
-               (lang, romanization, meaning, kind, note, origin, flags)
-               VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [
+               (lang, romanization, ipa, meaning, kind, note, origin, flags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
                     &lang.id,
                     &rom,
+                    &phon,
                     &args.meaning,
                     &normalize_text(&args.kind),
                     &args.note.unwrap_or(String::new()),
@@ -342,7 +433,7 @@ impl Wdb {
 
     fn deromanize(&mut self, args: PhonArgs) {
         let languages = args
-            .language_id
+            .language
             .as_ref()
             .map(|l| vec![self.get_lang(l).unwrap()])
             .unwrap_or_else(|| self.get_langs().unwrap());
@@ -368,15 +459,10 @@ impl Wdb {
 
             any_change = true;
 
-            let lexurgy = LexurgyCmd {
-                mode: LexurgyMode::Deromanize,
-                input: format!("{}_rom", &lang.id),
-                output: None,
-                rule: lang.rule.clone(),
-            };
+            let lexurgy = LexurgyCmd::deromanize(&lang);
             println!("Running `{}` deromanization rule...", &lang.rule);
             let phons = lexurgy
-                .run(words.iter().map(|w| &w.romanization[..]))
+                .run(&self.cfg, words.iter().map(|w| &w.romanization[..]))
                 .unwrap();
             if phons.len() != words.len() {
                 println!(
@@ -414,23 +500,44 @@ impl Wdb {
     }
 }
 
+fn find_obsidian_root() -> PathBuf {
+    let cur = env::current_dir().unwrap();
+    let mut obsidian = PathBuf::new();
+    for root in cur.ancestors() {
+        obsidian.clear();
+        obsidian.push(root);
+        obsidian.push(".obsidian");
+        if obsidian.exists() {
+            return root.into();
+        }
+    }
+    println!("Error: you must run this command from inside of an Obsidian vault!");
+    process::exit(1);
+}
+
+fn load_settings(root: &path::Path) -> Settings {
+    toml::from_str(&fs::read_to_string(root.join("Wdb.toml")).expect("No `Wdb.toml` settings file present")).unwrap()
+}
+
 fn main() {
-    if cfg!(debug_assertion) {
+    if cfg!(debug_assertions) {
         println!(
             "NOTE: Running in debug, changes are done to the `lang-dev.db` instead of `lang.db`\n"
         );
     }
     let mut cli = Cli::parse();
-    cli.debug_mode |= cfg!(debug_assertion);
+    let root = find_obsidian_root();
+    let settings = load_settings(&root);
+    let mut cfg = Config::new(root, settings, cli.debug_mode | cfg!(debug_assertions));
 
-    let mut wdb = Wdb::new().unwrap();
+    let mut wdb = Wdb::new(cfg).unwrap();
 
     match cli.command {
         Some(Command::Dump(args)) => wdb.dump(args),
         Some(Command::List) => wdb.list(),
         Some(Command::Add(args)) => wdb.add(args),
         Some(Command::Phon(args)) => {
-            cli.disable_checks = args.language_id.is_none();
+            cli.disable_checks = args.language.is_none();
             wdb.deromanize(args)
         }
         None => {}
