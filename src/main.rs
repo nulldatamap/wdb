@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::*;
 
-use anyhow::{bail, Result, Context};
+use anyhow::{bail, anyhow, Result, Context};
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{params, Connection, Row};
 use serde::{Serialize, Deserialize};
@@ -79,6 +79,8 @@ enum Command {
     Edit(EditArgs),
     /// Delete a word
     Del(DelArgs),
+    /// Evolve a sentence
+    Evolve(EvolveArgs),
     /// Dump a language's lexical inventory
     Dump(DumpArgs),
     /// List all languages
@@ -155,6 +157,19 @@ struct DelArgs {
 }
 
 #[derive(Args, Debug)]
+struct EvolveArgs {
+    /// The source language
+    from_lang: String,
+    /// The target language
+    to_lang: String,
+    /// The sentence to evolve
+    sentence: Vec<String>,
+    /// Show intermediate versions
+    #[arg(short = 'i', long)]
+    show_intermediate: bool,
+}
+
+#[derive(Args, Debug)]
 struct PhonArgs {
     #[arg(short, long = "lang")]
     language: Option<String>,
@@ -226,37 +241,45 @@ struct Wdb {
     cfg: Config,
 }
 
-enum LexurgyMode {
-    Evolve,
-    Deromanize,
-    Romanize,
-}
-
-struct LexurgyCmd {
-    input: String,
-    rule: String,
+struct LexurgyCmd<'a> {
+    target_lang: &'a LangEntry,
     output: Option<String>,
-    mode: LexurgyMode,
+    evolve: bool,
+    deromanize: bool,
+    romanize: bool,
 }
 
-impl LexurgyCmd {
-    fn deromanize(lang: &LangEntry) -> LexurgyCmd {
+impl<'a> LexurgyCmd<'a> {
+    fn evolve(to: &'a LangEntry, derom: bool, rom: bool) -> LexurgyCmd<'a> {
         LexurgyCmd {
-            mode: LexurgyMode::Deromanize,
-            input: format!("{}_rom", &lang.id),
+            target_lang: to,
             output: None,
-            rule: lang.rule.clone(),
+            evolve: true,
+            deromanize: derom,
+            romanize: rom,
         }
     }
 
-    fn run<'a>(self, cfg: &Config, words: impl Iterator<Item = &'a str>) -> Result<Vec<String>> {
+    fn deromanize(lang: &'a LangEntry) -> LexurgyCmd<'a> {
+        LexurgyCmd {
+            target_lang: lang,
+            output: None,
+            evolve: false,
+            deromanize: true,
+            romanize: false,
+        }
+    }
+
+    fn run<'b>(self, cfg: &Config, words: impl Iterator<Item = &'b str>) -> Result<Vec<String>> {
         use std::fs::File;
         use std::io::{BufRead, BufReader, BufWriter, Write};
         use std::process::*;
 
+        let input_name =
+            format!("{}_{}", &self.target_lang.id, if self.romanize { "rom" } else { "phon" });
         let mut wli = PathBuf::new();
         wli.push(cfg.word_list_folder());
-        wli.push(&self.input);
+        wli.push(&input_name);
         wli.set_extension("wli");
 
         {
@@ -271,7 +294,7 @@ impl LexurgyCmd {
 
         let mut lsc = PathBuf::new();
         lsc.push(cfg.rule_list_folder());
-        lsc.push(self.rule);
+        lsc.push(&self.target_lang.rule);
         lsc.set_extension("lsc");
 
         let mut out = PathBuf::new();
@@ -290,18 +313,21 @@ impl LexurgyCmd {
             .arg("--out-dir")
             .arg(&out);
 
-        match self.mode {
-            LexurgyMode::Evolve => {
-                panic!("TODO!")
-            }
-            LexurgyMode::Romanize => {
-                panic!("TODO!")
-            }
-            LexurgyMode::Deromanize => {
-                lexurgy.arg("-p").arg("-b").arg("init");
-            }
+        if self.deromanize && !self.evolve {
+            lexurgy.arg("-b").arg("init");
+        } else if !self.deromanize && self.evolve {
+            lexurgy.arg("-a").arg("init");
+        } else if !self.deromanize && !self.evolve {
+            bail!("Internal error! It doesn't make sense to neither want to deromanize nor to evovle");
         }
 
+        if !self.romanize {
+            lexurgy.arg("-p");
+        }
+
+        if cfg.debug_mode {
+            println!("Running lexurgy with: {:?}", lexurgy.get_args());
+        }
         let cmd = format!("{:?}", &lexurgy);
         let output = lexurgy.output()?;
         if !output.status.success() {
@@ -316,7 +342,7 @@ impl LexurgyCmd {
         let mut ev_wli = PathBuf::new();
         ev_wli.push(cfg.word_list_folder());
         ev_wli.push("out");
-        ev_wli.push(format!("{}_ev", &self.input));
+        ev_wli.push(format!("{}_ev", &input_name));
         ev_wli.set_extension("wli");
         let f = File::open(ev_wli)?;
         let reader = BufReader::new(f);
@@ -506,7 +532,7 @@ impl Wdb {
         use std::fmt::Write;
         use rusqlite::ToSql;
         let lang = self.get_lang(&args.language)?;
-        let mut rom = normalize_text(&args.word);
+        let rom = normalize_text(&args.word);
         if let Some(entry) = self.try_get_unique_word(&lang, &rom)? {
             let mut changed = format!("Changed the following for `{}`:\n", rom);
             let mut query_str = "UPDATE words SET ".to_string();
@@ -537,11 +563,65 @@ impl Wdb {
 
     fn del(&mut self, args: DelArgs) -> Result<()> {
         let lang = self.get_lang(&args.language)?;
-        let mut rom = normalize_text(&args.word);
+        let rom = normalize_text(&args.word);
         if let Some(entry) = self.try_get_unique_word(&lang, &rom)? {
             let _ = self.db.execute("DELETE FROM words WHERE id = ?", [entry.id])?;
             println!("Deleted: {}: {} ({})", entry.romanization, entry.meaning, entry.kind);
         }
+        Ok(())
+    }
+
+    fn evolve(&mut self, args: EvolveArgs) -> Result<()> {
+        let langs = self.get_langs()?;
+        let from = langs.iter()
+            .find(|l| l.id == args.from_lang)
+            .ok_or(anyhow!("No such 'from' language: `{}`", args.from_lang))?;
+        let to = langs.iter()
+            .find(|l| l.id == args.to_lang)
+            .ok_or(anyhow!("No such 'to' language: `{}`", args.to_lang))?;
+
+        if from.id == to.id {
+            bail!("'from' and 'to' language are the same. Nothing to evolve");
+        }
+
+        let mut steps = vec![];
+        let mut l = to;
+        while let Some(ref l_id) = l.origin {
+            steps.push(l);
+
+            l = langs.iter()
+                .find(|l| &l.id == l_id)
+                .ok_or(anyhow!("Internal Error! Language {}({}) has an invalid origin language: `{}`",
+                               l.name, l.id, l_id))?;
+
+            if l_id == &from.id { break; }
+        }
+
+        if l.id != from.id {
+            bail!("{}({}) is not a descendent of {}({})!",
+                  to.name, to.id, from.name, from.id);
+        }
+
+        let mut tokens = vec![];
+        for sentence_fragment in args.sentence {
+            tokens.extend(sentence_fragment.split(' ').map(|f| f.replace('-', " ")));
+        }
+
+        let mut first = true;
+        for step in steps.iter().rev() {
+            let new_tokens = LexurgyCmd::evolve(step, first, step.id == to.id)
+                .run(&self.cfg, tokens.iter().map(|x| &x[..]))?;
+            tokens = new_tokens;
+            first = false;
+            if step.id == to.id || args.show_intermediate {
+                for tok in &tokens {
+                    print!("{} ", tok);
+                }
+                println!();
+
+            }
+        }
+
         Ok(())
     }
 
@@ -679,6 +759,7 @@ fn main() -> Result<()> {
             Some(Command::Add(args)) => wdb.add(args)?,
             Some(Command::Edit(args)) => wdb.edit(args)?,
             Some(Command::Del(args)) => wdb.del(args)?,
+            Some(Command::Evolve(args)) => wdb.evolve(args)?,
             Some(Command::Phon(args)) => {
                 cli.disable_checks = args.language.is_none();
                 wdb.deromanize(args)?
