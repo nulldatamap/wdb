@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::*;
 
-use anyhow::{bail, anyhow, Result, Context};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{params, Connection, Row};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use tinytemplate::TinyTemplate;
 
 #[derive(Deserialize)]
@@ -15,6 +15,7 @@ struct Settings {
     rule_list_folder: String,
     dictionary_file_template: String,
     dictionary_template: String,
+    auto_dump: bool,
 }
 
 struct Config {
@@ -77,6 +78,8 @@ enum Command {
     Add(AddArgs),
     /// Edit a word
     Edit(EditArgs),
+    /// Inherit a word from the language's predecessor
+    Inherit(InheritArgs),
     /// Delete a word
     Del(DelArgs),
     /// Evolve a sentence
@@ -149,6 +152,23 @@ struct EditArgs {
 }
 
 #[derive(Args, Debug)]
+struct InheritArgs {
+    /// The language to add the word to
+    language: String,
+    /// The romanized spelling of the word
+    word: String,
+    /// The meaning of the word
+    #[arg(short, long)]
+    meaning: Option<String>,
+    /// The part-of-speech the word belond to (v, n, adv, adj, inj, conj, adp)
+    #[arg(short, long)]
+    kind: Option<String>,
+    /// Attach a note to the word (arbitrary text)
+    #[arg(short, long)]
+    note: Option<String>,
+}
+
+#[derive(Args, Debug)]
 struct DelArgs {
     /// The language to add the word to
     language: String,
@@ -164,6 +184,8 @@ struct EvolveArgs {
     to_lang: String,
     /// The sentence to evolve
     sentence: Vec<String>,
+    #[arg(short = 'b')]
+    stop_before: Option<String>,
     /// Show intermediate versions
     #[arg(short = 'i', long)]
     show_intermediate: bool,
@@ -177,6 +199,21 @@ struct PhonArgs {
     #[arg(short, long)]
     force: bool,
 }
+
+/*
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum OriginKind {
+    Inherited {
+        from_lang: String,
+        romanization: String,
+        word_id: u32,
+    },
+    Compound {
+
+    }
+}
+*/
 
 #[derive(Debug, Serialize)]
 struct WordEntry {
@@ -241,22 +278,78 @@ struct Wdb {
     cfg: Config,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum LexurgyInput {
+    Romanized,
+    Phonetic,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum LexurgyOutput {
+    Romanized,
+    Phonetic,
+    Both,
+}
+
 struct LexurgyCmd<'a> {
     target_lang: &'a LangEntry,
     output: Option<String>,
     evolve: bool,
-    deromanize: bool,
-    romanize: bool,
+    input_format: LexurgyInput,
+    output_format: LexurgyOutput,
+    stop_before: Option<String>,
+}
+
+enum WordOutput {
+    Phon(String),
+    Rom(String),
+    PhonRom(String, String),
+}
+
+impl WordOutput {
+    fn get_value(self) -> Result<String> {
+        match self {
+            WordOutput::Phon(x) => Ok(x),
+            WordOutput::Rom(x) => Ok(x),
+            WordOutput::PhonRom(_, _) => {
+                bail!("Expected a single value, but this word output has two")
+            }
+        }
+    }
+
+    fn get_rom(self) -> Result<String> {
+        match self {
+            WordOutput::Phon(_) => bail!("Expected romanized word, got phonetic word"),
+            WordOutput::Rom(x) => Ok(x),
+            WordOutput::PhonRom(_, x) => Ok(x),
+        }
+    }
+
+    fn get_phon(self) -> Result<String> {
+        match self {
+            WordOutput::Phon(x) => Ok(x),
+            WordOutput::Rom(_) => bail!("Expected phonetic word, got romanized word"),
+            WordOutput::PhonRom(x, _) => Ok(x),
+        }
+    }
+
+    fn get_phon_rom(self) -> Result<(String, String)> {
+        match self {
+            WordOutput::PhonRom(p, r) => Ok((p, r)),
+            _ => bail!("Expected both phonetic and romanized versions of the word"),
+        }
+    }
 }
 
 impl<'a> LexurgyCmd<'a> {
-    fn evolve(to: &'a LangEntry, derom: bool, rom: bool) -> LexurgyCmd<'a> {
+    fn evolve(to: &'a LangEntry, inp: LexurgyInput, out: LexurgyOutput) -> LexurgyCmd<'a> {
         LexurgyCmd {
             target_lang: to,
             output: None,
             evolve: true,
-            deromanize: derom,
-            romanize: rom,
+            input_format: inp,
+            output_format: out,
+            stop_before: None,
         }
     }
 
@@ -265,18 +358,30 @@ impl<'a> LexurgyCmd<'a> {
             target_lang: lang,
             output: None,
             evolve: false,
-            deromanize: true,
-            romanize: false,
+            input_format: LexurgyInput::Romanized,
+            output_format: LexurgyOutput::Phonetic,
+            stop_before: None,
         }
     }
 
-    fn run<'b>(self, cfg: &Config, words: impl Iterator<Item = &'b str>) -> Result<Vec<String>> {
+    fn run<'b>(
+        self,
+        cfg: &Config,
+        words: impl Iterator<Item = &'b str>,
+    ) -> Result<Vec<WordOutput>> {
         use std::fs::File;
         use std::io::{BufRead, BufReader, BufWriter, Write};
         use std::process::*;
 
-        let input_name =
-            format!("{}_{}", &self.target_lang.id, if self.romanize { "rom" } else { "phon" });
+        let input_name = format!(
+            "{}_{}",
+            &self.target_lang.id,
+            if self.input_format == LexurgyInput::Romanized {
+                "rom"
+            } else {
+                "phon"
+            }
+        );
         let mut wli = PathBuf::new();
         wli.push(cfg.word_list_folder());
         wli.push(&input_name);
@@ -313,16 +418,33 @@ impl<'a> LexurgyCmd<'a> {
             .arg("--out-dir")
             .arg(&out);
 
-        if self.deromanize && !self.evolve {
+        let derom = self.input_format == LexurgyInput::Romanized;
+
+        if derom && !self.evolve {
+            if self.stop_before.is_some() {
+                bail!("Can't specify `--stop-before` together with a pure deromanize command");
+            }
             lexurgy.arg("-b").arg("init");
-        } else if !self.deromanize && self.evolve {
+        } else if !derom && self.evolve {
             lexurgy.arg("-a").arg("init");
-        } else if !self.deromanize && !self.evolve {
-            bail!("Internal error! It doesn't make sense to neither want to deromanize nor to evovle");
+        } else if !derom && !self.evolve {
+            bail!(
+                "Internal error! It doesn't make sense to neither want to deromanize nor to evovle"
+            );
         }
 
-        if !self.romanize {
-            lexurgy.arg("-p");
+        if let Some(b) = self.stop_before.as_ref() {
+            lexurgy.arg("-b").arg(b);
+        }
+
+        match self.output_format {
+            LexurgyOutput::Phonetic => {
+                lexurgy.arg("-p");
+            }
+            LexurgyOutput::Both => {
+                lexurgy.arg("-m");
+            }
+            LexurgyOutput::Romanized => {}
         }
 
         if cfg.debug_mode {
@@ -343,10 +465,34 @@ impl<'a> LexurgyCmd<'a> {
         ev_wli.push(cfg.word_list_folder());
         ev_wli.push("out");
         ev_wli.push(format!("{}_ev", &input_name));
-        ev_wli.set_extension("wli");
+        if self.output_format == LexurgyOutput::Both {
+            ev_wli.set_extension("wlm");
+        } else {
+            ev_wli.set_extension("wli");
+        }
         let f = File::open(ev_wli)?;
         let reader = BufReader::new(f);
-        Ok(reader.lines().collect::<Result<_, _>>()?)
+        Ok(reader
+            .lines()
+            .map(|l| match self.output_format {
+                LexurgyOutput::Romanized => Ok(WordOutput::Rom(l?)),
+                LexurgyOutput::Phonetic => Ok(WordOutput::Phon(l?)),
+                LexurgyOutput::Both => {
+                    let l = l?;
+                    let mut parts = l.split("=>").map(|p| p.trim()).collect::<Vec<_>>();
+                    if parts.len() < 3 {
+                        bail!("Expected at least three steps, got: {}", parts.len());
+                    }
+                    let rom = parts
+                        .pop()
+                        .ok_or(anyhow!("Expected romanized part of output"))?;
+                    let phon = parts
+                        .pop()
+                        .ok_or(anyhow!("Expecetd phonetic part of ouput"))?;
+                    Ok(WordOutput::PhonRom(phon.to_string(), rom.to_string()))
+                }
+            })
+            .collect::<Result<_, _>>()?)
     }
 }
 
@@ -382,15 +528,20 @@ impl Wdb {
         let mut stmt = self
             .db
             .prepare("SELECT * FROM words WHERE lang = ? ORDER BY romanization")?;
-        let entries = stmt.query_map([&lang.id], WordEntry::from_row)?.collect::<Result<_, _>>()?;
+        let entries = stmt
+            .query_map([&lang.id], WordEntry::from_row)?
+            .collect::<Result<_, _>>()?;
         let mut tt = TinyTemplate::new();
-        tt.add_template("dictionary_file", &self.cfg.settings.dictionary_file_template)?;
+        tt.add_template(
+            "dictionary_file",
+            &self.cfg.settings.dictionary_file_template,
+        )?;
         tt.add_template("dictionary", &self.cfg.settings.dictionary_template)?;
 
         #[derive(Serialize)]
         struct DictionaryTemplateContext {
             lang: LangEntry,
-            words: Vec<WordEntry>
+            words: Vec<WordEntry>,
         }
 
         let context = DictionaryTemplateContext {
@@ -400,7 +551,8 @@ impl Wdb {
 
         let mut dict_file = self.cfg.root.to_path_buf();
         dict_file.push(tt.render("dictionary_file", &context)?);
-        fs::write(&dict_file, tt.render("dictionary", &context)?).with_context(|| format!("Writing dictionary file: {:?}", &dict_file))?;
+        fs::write(&dict_file, tt.render("dictionary", &context)?)
+            .with_context(|| format!("Writing dictionary file: {:?}", &dict_file))?;
 
         Ok(())
     }
@@ -459,8 +611,9 @@ impl Wdb {
             if phons.len() != 1 {
                 bail!("expected a single word back, got {}", phons.len());
             }
-            println!("  {} => {}", &rom, &phons[0]);
-            phon = Some(phons.remove(0));
+            let p = phons.remove(0).get_phon()?;
+            println!("  {} => {}", &rom, &p);
+            phon = Some(p);
         }
 
         let _ = self.db.execute(
@@ -479,6 +632,11 @@ impl Wdb {
             ],
         )?;
         println!("Added `{}` to {}", &args.word, lang);
+        if self.cfg.settings.auto_dump {
+            self.dump(DumpArgs {
+                language: args.language,
+            })?;
+        }
         Ok(())
     }
 
@@ -491,8 +649,12 @@ impl Wdb {
             rom = r;
         }
 
-        let mut stmt = self.db.prepare("SELECT * FROM words WHERE lang = ? AND romanization = ? ORDER BY romanization")?;
-        let mut words = stmt.query_map(params!(&lang.id, &rom), WordEntry::from_row)?.collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = self.db.prepare(
+            "SELECT * FROM words WHERE lang = ? AND romanization = ? ORDER BY romanization",
+        )?;
+        let mut words = stmt
+            .query_map(params!(&lang.id, &rom), WordEntry::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
 
         if words.is_empty() {
             bail!("No matching words found");
@@ -510,11 +672,11 @@ impl Wdb {
                 }
                 bail!(err_msg);
             }
-            return Ok(Some(words.swap_remove(index)))
+            return Ok(Some(words.swap_remove(index)));
         }
 
         if words.len() == 1 {
-            return Ok(Some(words.swap_remove(0)))
+            return Ok(Some(words.swap_remove(0)));
         }
 
         let mut err_msg = format!("`{0}` has homophones, please specify by passing `{0}#N` where N is one of the following indices:\n", &rom);
@@ -529,34 +691,51 @@ impl Wdb {
     }
 
     fn edit(&mut self, args: EditArgs) -> Result<()> {
-        use std::fmt::Write;
         use rusqlite::ToSql;
+        use std::fmt::Write;
         let lang = self.get_lang(&args.language)?;
         let rom = normalize_text(&args.word);
         if let Some(entry) = self.try_get_unique_word(&lang, &rom)? {
             let mut changed = format!("Changed the following for `{}`:\n", rom);
             let mut query_str = "UPDATE words SET ".to_string();
             let mut first = true;
-            let fields = &[("meaning", Some(&entry.meaning), &args.meaning),
-                           ("kind", Some(&entry.kind), &args.kind),
-                           ("origin", entry.origin.as_ref(), &args.origin),
-                           ("note", entry.note.as_ref(), &args.note)];
+            let fields = &[
+                ("meaning", Some(&entry.meaning), &args.meaning),
+                ("kind", Some(&entry.kind), &args.kind),
+                ("origin", entry.origin.as_ref(), &args.origin),
+                ("note", entry.note.as_ref(), &args.note),
+            ];
             for (fld, old, val) in fields {
                 if let Some(v) = val {
-                    if !first { query_str.push_str(", "); }
+                    if !first {
+                        query_str.push_str(", ");
+                    }
                     write!(&mut query_str, "{} = ?", fld)?;
-                    write!(&mut changed, " {}: {} => {}\n", fld, old.unwrap_or(&"<unset>".to_string()), v)?;
+                    write!(
+                        &mut changed,
+                        " {}: {} => {}\n",
+                        fld,
+                        old.unwrap_or(&"<unset>".to_string()),
+                        v
+                    )?;
                 }
                 first = false;
             }
             query_str.push_str(" WHERE id = ?");
-            let vs = fields.iter()
+            let vs = fields
+                .iter()
                 .filter_map(|(_, _, val)| val.as_ref().map(|v| v.to_sql()))
-                .chain(iter::once(entry.id.to_sql())).collect::<Result<Vec<_>, _>>()?;
-            let _ = self.db.execute(&query_str[..], rusqlite::params_from_iter(
-                vs.iter()
-            ))?;
+                .chain(iter::once(entry.id.to_sql()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let _ = self
+                .db
+                .execute(&query_str[..], rusqlite::params_from_iter(vs.iter()))?;
             println!("{}", changed);
+            if self.cfg.settings.auto_dump {
+                self.dump(DumpArgs {
+                    language: args.language,
+                })?;
+            }
         }
         Ok(())
     }
@@ -565,18 +744,30 @@ impl Wdb {
         let lang = self.get_lang(&args.language)?;
         let rom = normalize_text(&args.word);
         if let Some(entry) = self.try_get_unique_word(&lang, &rom)? {
-            let _ = self.db.execute("DELETE FROM words WHERE id = ?", [entry.id])?;
-            println!("Deleted: {}: {} ({})", entry.romanization, entry.meaning, entry.kind);
+            let _ = self
+                .db
+                .execute("DELETE FROM words WHERE id = ?", [entry.id])?;
+            println!(
+                "Deleted: {}: {} ({})",
+                entry.romanization, entry.meaning, entry.kind
+            );
+            if self.cfg.settings.auto_dump {
+                self.dump(DumpArgs {
+                    language: args.language,
+                })?;
+            }
         }
         Ok(())
     }
 
     fn evolve(&mut self, args: EvolveArgs) -> Result<()> {
         let langs = self.get_langs()?;
-        let from = langs.iter()
+        let from = langs
+            .iter()
             .find(|l| l.id == args.from_lang)
             .ok_or(anyhow!("No such 'from' language: `{}`", args.from_lang))?;
-        let to = langs.iter()
+        let to = langs
+            .iter()
             .find(|l| l.id == args.to_lang)
             .ok_or(anyhow!("No such 'to' language: `{}`", args.to_lang))?;
 
@@ -589,17 +780,26 @@ impl Wdb {
         while let Some(ref l_id) = l.origin {
             steps.push(l);
 
-            l = langs.iter()
-                .find(|l| &l.id == l_id)
-                .ok_or(anyhow!("Internal Error! Language {}({}) has an invalid origin language: `{}`",
-                               l.name, l.id, l_id))?;
+            l = langs.iter().find(|l| &l.id == l_id).ok_or(anyhow!(
+                "Internal Error! Language {}({}) has an invalid origin language: `{}`",
+                l.name,
+                l.id,
+                l_id
+            ))?;
 
-            if l_id == &from.id { break; }
+            if l_id == &from.id {
+                break;
+            }
         }
 
         if l.id != from.id {
-            bail!("{}({}) is not a descendent of {}({})!",
-                  to.name, to.id, from.name, from.id);
+            bail!(
+                "{}({}) is not a descendent of {}({})!",
+                to.name,
+                to.id,
+                from.name,
+                from.id
+            );
         }
 
         let mut tokens = vec![];
@@ -609,19 +809,101 @@ impl Wdb {
 
         let mut first = true;
         for step in steps.iter().rev() {
-            let new_tokens = LexurgyCmd::evolve(step, first, step.id == to.id)
-                .run(&self.cfg, tokens.iter().map(|x| &x[..]))?;
-            tokens = new_tokens;
+            let mut cmd = LexurgyCmd::evolve(
+                step,
+                if first {
+                    LexurgyInput::Romanized
+                } else {
+                    LexurgyInput::Phonetic
+                },
+                if step.id == to.id {
+                    LexurgyOutput::Romanized
+                } else {
+                    LexurgyOutput::Phonetic
+                },
+            );
+            cmd.stop_before = args.stop_before.clone();
+            let new_tokens = cmd.run(&self.cfg, tokens.iter().map(|x| &x[..]))?;
+            tokens.clear();
+            for tok in new_tokens {
+                tokens.push(tok.get_value()?);
+            }
             first = false;
             if step.id == to.id || args.show_intermediate {
                 for tok in &tokens {
                     print!("{} ", tok);
                 }
                 println!();
-
             }
         }
 
+        Ok(())
+    }
+
+    fn inherit(&mut self, args: InheritArgs) -> Result<()> {
+        let dest_lang = self.get_lang(&args.language)?;
+        if dest_lang.origin.is_none() {
+            bail!("There no parent language to inherit from!");
+        }
+        let src_lang = self.get_lang(dest_lang.origin.as_ref().unwrap())?;
+        let mut words: Vec<WordEntry> = Vec::new();
+        if args.word == "*" {
+            let mut stmt = self.db.prepare("SELECT * FROM words WHERE lang = ?")?;
+            words = stmt.query_map(params![&src_lang.id], WordEntry::from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+        } else {
+            if let Some(word) = self.try_get_unique_word(&src_lang, &args.word)? {
+                words.push(word);
+            } else {
+                return Ok(());
+            }
+        }
+
+        let phon = words.iter().map(|w| w.ipa.as_ref().map(|p| &p[..]).ok_or(anyhow!(
+            "The inherited words must have a phonetic annotation"
+        ))).collect::<Result<Vec<&str>>>()?;
+        println!("Applying sound changes..");
+        let evolved =
+            LexurgyCmd::evolve(&dest_lang, LexurgyInput::Phonetic, LexurgyOutput::Both)
+            .run(&self.cfg, phon.into_iter())?;
+        if evolved.len() != words.len() {
+            bail!("Expected {} resulting word, got: {}", words.len(), evolved.len());
+        }
+        let tr = self.db.transaction()?;
+        for (word, output) in words.iter().zip(evolved.into_iter()) {
+            let (phon, rom) = output.get_phon_rom()?;
+            println!(
+                "  {} ({}) => {} ({})",
+                &word.romanization,
+                word.ipa.as_ref().unwrap(),
+                &rom,
+                &phon
+            );
+            let _ = tr.execute(
+                "INSERT INTO words
+                (lang, romanization, ipa, meaning, kind, note, origin, flags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    dest_lang.id,
+                    rom,
+                    phon,
+                    args.meaning.as_ref().unwrap_or(&word.meaning),
+                    args.kind.as_ref().unwrap_or(&word.kind),
+                    args.note.as_ref().or(word.note.as_ref()),
+                    format!(
+                        "(inherited {} {} {})",
+                        src_lang.id, word.romanization, word.id
+                    ),
+                    word.flags
+                ],
+            )?;
+        }
+        let _ = tr.commit()?;
+        if self.cfg.settings.auto_dump {
+            self.dump(DumpArgs {
+                language: args.language,
+            })?;
+        }
         Ok(())
     }
 
@@ -675,7 +957,11 @@ impl Wdb {
 
             let lexurgy = LexurgyCmd::deromanize(&lang);
             println!("Running `{}` deromanization rule...", &lang.rule);
-            let phons = lexurgy.run(&self.cfg, words.iter().map(|w| &w.romanization[..]))?;
+            let phons = lexurgy
+                .run(&self.cfg, words.iter().map(|w| &w.romanization[..]))?
+                .into_iter()
+                .map(|o| o.get_phon())
+                .collect::<Result<Vec<_>>>()?;
             if phons.len() != words.len() {
                 println!(
                     "Number of words out ({}) doesn't match number of words in({})!'",
@@ -705,6 +991,11 @@ impl Wdb {
                 );
             } else {
                 println!("Updated {} word entries", words.len());
+                if words.len() != 0 {
+                    if self.cfg.settings.auto_dump {
+                        self.dump(DumpArgs { language: lang.id })?;
+                    }
+                }
             }
         }
 
@@ -739,17 +1030,21 @@ fn main() -> Result<()> {
     let mut cli = Cli::parse();
     let root = find_obsidian_root()?;
     let settings = load_settings(&root)?;
-    if cfg!(debug_assertions) {
+    let cfg = Config::new(root, settings, cli.debug_mode | cfg!(debug_assertions));
+    if cfg.debug_mode {
         println!(
             "NOTE: Running in debug, changes are done to the `{}` instead of `{}`\n",
-            &settings.db_dev_file, &settings.db_file,
+            &cfg.settings.db_dev_file, &cfg.settings.db_file,
         );
     }
-    let cfg = Config::new(root, settings, cli.debug_mode | cfg!(debug_assertions));
 
     let mut wdb = Wdb::new(cfg)?;
     let mut cmd = cli.command;
-    let interactive = if let Some(Command::Interactive) = cmd { true } else { false };
+    let interactive = if let Some(Command::Interactive) = cmd {
+        true
+    } else {
+        false
+    };
     let mut buf = String::new();
 
     loop {
@@ -760,18 +1055,26 @@ fn main() -> Result<()> {
             Some(Command::Edit(args)) => wdb.edit(args)?,
             Some(Command::Del(args)) => wdb.del(args)?,
             Some(Command::Evolve(args)) => wdb.evolve(args)?,
+            Some(Command::Inherit(args)) => wdb.inherit(args)?,
             Some(Command::Phon(args)) => {
                 cli.disable_checks = args.language.is_none();
                 wdb.deromanize(args)?
             }
-            _ => {},
+            _ => {}
         }
-        if !interactive { break }
+        if !interactive {
+            break;
+        }
         loop {
             std::io::stdin().read_line(&mut buf)?;
             match Cli::try_parse_from(buf.split(' ')) {
-                Err(err) => { println!("Failed to parse command: {:?}", err) },
-                Ok(Cli { command: c, .. }) => { cmd = c; break; }
+                Err(err) => {
+                    println!("Failed to parse command: {:?}", err)
+                }
+                Ok(Cli { command: c, .. }) => {
+                    cmd = c;
+                    break;
+                }
             }
         }
     }

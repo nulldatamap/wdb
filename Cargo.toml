@@ -1,4 +1,3 @@
-workspace = { members = ["lsc"] }
 [package]
 name = "wdb"
 version = "0.1.0"
