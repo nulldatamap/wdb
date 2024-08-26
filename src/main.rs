@@ -186,6 +186,10 @@ struct EvolveArgs {
     sentence: Vec<String>,
     #[arg(short = 'b')]
     stop_before: Option<String>,
+    #[arg(short = 'a')]
+    start_at: Option<String>,
+    #[arg(short = 'p')]
+    show_phonetic: bool,
     /// Show intermediate versions
     #[arg(short = 'i', long)]
     show_intermediate: bool,
@@ -298,6 +302,7 @@ struct LexurgyCmd<'a> {
     input_format: LexurgyInput,
     output_format: LexurgyOutput,
     stop_before: Option<String>,
+    start_at: Option<String>,
 }
 
 enum WordOutput {
@@ -307,6 +312,39 @@ enum WordOutput {
 }
 
 impl WordOutput {
+    fn get_value_ref(&self) -> Result<&str> {
+        match self {
+            WordOutput::Phon(x) => Ok(x),
+            WordOutput::Rom(x) => Ok(x),
+            WordOutput::PhonRom(_, _) => {
+                bail!("Expected a single value, but this word output has two")
+            }
+        }
+    }
+
+    fn get_rom_ref(&self) -> Result<&str> {
+        match self {
+            WordOutput::Phon(_) => bail!("Expected romanized word, got phonetic word"),
+            WordOutput::Rom(x) => Ok(x),
+            WordOutput::PhonRom(_, x) => Ok(x),
+        }
+    }
+
+    fn get_phon_ref(&self) -> Result<&str> {
+        match self {
+            WordOutput::Phon(x) => Ok(x),
+            WordOutput::Rom(_) => bail!("Expected phonetic word, got romanized word"),
+            WordOutput::PhonRom(x, _) => Ok(x),
+        }
+    }
+
+    fn get_phon_rom_ref(&self) -> Result<(&str, &str)> {
+        match self {
+            WordOutput::PhonRom(p, r) => Ok((p, r)),
+            _ => bail!("Expected both phonetic and romanized versions of the word"),
+        }
+    }
+
     fn get_value(self) -> Result<String> {
         match self {
             WordOutput::Phon(x) => Ok(x),
@@ -350,6 +388,7 @@ impl<'a> LexurgyCmd<'a> {
             input_format: inp,
             output_format: out,
             stop_before: None,
+            start_at: None,
         }
     }
 
@@ -361,6 +400,7 @@ impl<'a> LexurgyCmd<'a> {
             input_format: LexurgyInput::Romanized,
             output_format: LexurgyOutput::Phonetic,
             stop_before: None,
+            start_at: None,
         }
     }
 
@@ -420,17 +460,23 @@ impl<'a> LexurgyCmd<'a> {
 
         let derom = self.input_format == LexurgyInput::Romanized;
 
+        let mut start = None;
+
         if derom && !self.evolve {
             if self.stop_before.is_some() {
                 bail!("Can't specify `--stop-before` together with a pure deromanize command");
             }
             lexurgy.arg("-b").arg("init");
         } else if !derom && self.evolve {
-            lexurgy.arg("-a").arg("init");
+            start = Some("init");
         } else if !derom && !self.evolve {
             bail!(
                 "Internal error! It doesn't make sense to neither want to deromanize nor to evovle"
             );
+        }
+
+        if let Some(a) = self.start_at.as_ref().map(|x| &x[..]).or(start) {
+            lexurgy.arg("-a").arg(a);
         }
 
         if let Some(b) = self.stop_before.as_ref() {
@@ -809,6 +855,7 @@ impl Wdb {
 
         let mut first = true;
         for step in steps.iter().rev() {
+            let last = step.id == to.id;
             let mut cmd = LexurgyCmd::evolve(
                 step,
                 if first {
@@ -816,20 +863,30 @@ impl Wdb {
                 } else {
                     LexurgyInput::Phonetic
                 },
-                if step.id == to.id {
-                    LexurgyOutput::Romanized
+                if last {
+                    if args.show_phonetic {
+                        LexurgyOutput::Phonetic
+                    } else {
+                        LexurgyOutput::Romanized
+                    }
                 } else {
                     LexurgyOutput::Phonetic
                 },
             );
-            cmd.stop_before = args.stop_before.clone();
+            if last {
+                cmd.stop_before = args.stop_before.clone();
+            }
+            if first {
+                cmd.start_at = args.start_at.clone();
+            }
             let new_tokens = cmd.run(&self.cfg, tokens.iter().map(|x| &x[..]))?;
             tokens.clear();
             for tok in new_tokens {
                 tokens.push(tok.get_value()?);
             }
             first = false;
-            if step.id == to.id || args.show_intermediate {
+            if last || args.show_intermediate {
+                print!("{}: ", step.id);
                 for tok in &tokens {
                     print!("{} ", tok);
                 }
@@ -849,7 +906,8 @@ impl Wdb {
         let mut words: Vec<WordEntry> = Vec::new();
         if args.word == "*" {
             let mut stmt = self.db.prepare("SELECT * FROM words WHERE lang = ?")?;
-            words = stmt.query_map(params![&src_lang.id], WordEntry::from_row)?
+            words = stmt
+                .query_map(params![&src_lang.id], WordEntry::from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
         } else {
             if let Some(word) = self.try_get_unique_word(&src_lang, &args.word)? {
@@ -859,15 +917,23 @@ impl Wdb {
             }
         }
 
-        let phon = words.iter().map(|w| w.ipa.as_ref().map(|p| &p[..]).ok_or(anyhow!(
-            "The inherited words must have a phonetic annotation"
-        ))).collect::<Result<Vec<&str>>>()?;
+        let phon = words
+            .iter()
+            .map(|w| {
+                w.ipa.as_ref().map(|p| &p[..]).ok_or(anyhow!(
+                    "The inherited words must have a phonetic annotation"
+                ))
+            })
+            .collect::<Result<Vec<&str>>>()?;
         println!("Applying sound changes..");
-        let evolved =
-            LexurgyCmd::evolve(&dest_lang, LexurgyInput::Phonetic, LexurgyOutput::Both)
+        let evolved = LexurgyCmd::evolve(&dest_lang, LexurgyInput::Phonetic, LexurgyOutput::Both)
             .run(&self.cfg, phon.into_iter())?;
         if evolved.len() != words.len() {
-            bail!("Expected {} resulting word, got: {}", words.len(), evolved.len());
+            bail!(
+                "Expected {} resulting word, got: {}",
+                words.len(),
+                evolved.len()
+            );
         }
         let tr = self.db.transaction()?;
         for (word, output) in words.iter().zip(evolved.into_iter()) {
